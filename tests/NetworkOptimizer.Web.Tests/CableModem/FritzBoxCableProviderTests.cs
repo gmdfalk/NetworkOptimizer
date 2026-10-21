@@ -39,6 +39,16 @@ public class FritzBoxCableProviderTests
         stats.UpstreamChannels.Should().HaveCount(4);
         stats.LockedDsChannels.Should().Be(26);
         stats.LockedUsChannels.Should().Be(4);
+        stats.DownstreamChannels.Select(c => c.ChannelId).Should().OnlyHaveUniqueItems();
+        stats.UpstreamChannels.Select(c => c.ChannelId).Should().OnlyHaveUniqueItems();
+        // These feed the dashboard, Influx history and alerts; include all RF channels,
+        // but only SC-QAM counters, as independently summed from the captured payload.
+        stats.DownstreamPowerAvgDbmv.Should().BeApproximately(4.9923076923, 0.000001);
+        stats.DownstreamSnrAvgDb.Should().BeApproximately(37.8, 0.000001);
+        stats.UpstreamPowerAvgDbmv.Should().BeApproximately(42.275, 0.000001);
+        stats.TotalCorrectables.Should().Be(985);
+        stats.TotalUncorrectables.Should().Be(4106);
+        stats.ChannelsWithUncorrectables.Should().Be(2);
         var scqam = stats.DownstreamChannels.Single(c => c.ChannelId == 6);
         scqam.Frequency.Should().Be(594_000_000);
         scqam.Modulation.Should().Be("QAM256");
@@ -207,6 +217,34 @@ public class FritzBoxCableProviderTests
     }
 
     [Fact]
+    public async Task Poll_Pbkdf2LoginPreservesFormEncodingAndUsesTheIssuedSession()
+    {
+        await using var device = new TestDevice();
+        const string username = "cable+über&stats=1";
+        const string response = "5A1722$1798a1672bca7c6463d6b245f82b53703b0f50813401b03e4045a5861e689adb";
+        device.Respond = (r, _) =>
+        {
+            if (r.Method == "GET" && r.Path == "/login_sid.lua?version=2")
+                return Task.FromResult(new Reply(Session(challenge: "2$10000$5A1711$2000$5A1722")));
+            if (r.Path == "/data.lua" && (!r.Form.TryGetValue("sid", out var sid)
+                                        || !device.Sessions.TryGetValue(sid, out var account) || account != username))
+                return Task.FromResult(new Reply("", 403));
+            return Task.FromResult(device.DefaultReply(r));
+        };
+
+        var result = await Provider().PollAsync(Context(device) with { Username = username, Password = "1example!" });
+
+        result.Success.Should().BeTrue(result.FailureReason);
+        result.Stats!.LockedDsChannels.Should().Be(26);
+        result.Stats.LockedUsChannels.Should().Be(4);
+        var login = device.Requests.Single(r => r.Form.ContainsKey("response"));
+        login.Path.Should().Be("/login_sid.lua?version=2");
+        login.Form["username"].Should().Be(username);
+        login.Form["response"].Should().Be(response);
+        device.Logouts.Should().Equal(device.Requests.Single(r => r.Path == "/data.lua").Form["sid"]);
+    }
+
+    [Fact]
     public async Task TestConnection_ReadsActualChannelsAndFallsBackWhenMetadataFails()
     {
         await using var device = new TestDevice();
@@ -344,8 +382,8 @@ public class FritzBoxCableProviderTests
         await test.Should().ThrowAsync<OperationCanceledException>();
     }
 
-    private static string Session(string sid = "0000000000000000", int blockTime = 0) =>
-        $"<SessionInfo><SID>{sid}</SID><Challenge>1234567z</Challenge><BlockTime>{blockTime}</BlockTime></SessionInfo>";
+    private static string Session(string sid = "0000000000000000", int blockTime = 0, string challenge = "1234567z") =>
+        $"<SessionInfo><SID>{sid}</SID><Challenge>{challenge}</Challenge><BlockTime>{blockTime}</BlockTime></SessionInfo>";
 
     private sealed record Request(string Method, string Path, string Host, Dictionary<string, string> Form);
     private sealed record Reply(string Body, int Status = 200, string? Location = null);
